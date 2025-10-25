@@ -1,107 +1,138 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests
-from bs4 import BeautifulSoup
-import re
-import logging
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import random
 
 app = Flask(__name__)
 CORS(app)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def clean_price(price_str):
-    if not price_str:
-        return None
-    price_str = price_str.replace('€', '').replace(',', '.').strip()
-    match = re.search(r'\d+\.?\d*', price_str)
-    return float(match.group()) if match else None
-
-def extract_asin_from_url(url):
-    match = re.search(r'/dp/([A-Z0-9]{10})', url)
-    return match.group(1) if match else None
-
-def scrape_amazon_product(asin):
-    url = f'https://www.amazon.es/dp/{asin}'
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+# Generate sample sales data
+def generate_sample_data(days=365):
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+    
+    # Generate realistic sales data with trends and seasonality
+    base_sales = 1000
+    trend = np.linspace(0, 500, len(date_range))
+    seasonality = 200 * np.sin(np.linspace(0, 4 * np.pi, len(date_range)))
+    noise = np.random.normal(0, 100, len(date_range))
+    
+    sales = base_sales + trend + seasonality + noise
+    sales = np.maximum(sales, 0)  # Ensure non-negative sales
+    
+    data = {
+        'date': date_range,
+        'sales': sales,
+        'units_sold': (sales / random.uniform(10, 50)).astype(int),
+        'category': np.random.choice(['Electronics', 'Clothing', 'Home', 'Books', 'Toys'], len(date_range))
     }
     
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        title = soup.select_one('#productTitle')
-        title = title.get_text().strip() if title else 'Título no disponible'
-        
-        price = soup.select_one('.a-price .a-offscreen')
-        price = clean_price(price.get_text()) if price else None
-        
-        rating = soup.select_one('span.a-icon-alt')
-        rating_text = rating.get_text() if rating else None
-        rating_value = float(rating_text.split()[0].replace(',', '.')) if rating_text else None
-        
-        image = soup.select_one('#landingImage')
-        image_url = image.get('src') if image else None
-        
-        return {
-            'asin': asin,
-            'title': title,
-            'price': price,
-            'currency': 'EUR',
-            'rating': rating_value,
-            'image_url': image_url,
-            'product_url': url
-        }
-        
-    except Exception as e:
-        logger.error(f'Error scraping ASIN {asin}: {str(e)}')
-        return {'error': str(e), 'asin': asin}
+    return pd.DataFrame(data)
+
+# Global variable to store data
+sales_data = generate_sample_data()
 
 @app.route('/')
 def home():
     return jsonify({
-        'status': 'API Amazon Sales funcionando',
+        'message': 'Amazon Sales Trend Analysis API',
+        'version': '1.0',
         'endpoints': {
-            '/product/<asin>': 'Obtener info de producto por ASIN',
-            '/products': 'POST con {"asins": ["B0...", "B0..."]} o {"urls": ["https://...", ...]}'
+            '/api/sales': 'Get all sales data',
+            '/api/sales/summary': 'Get sales summary statistics',
+            '/api/sales/trend': 'Get sales trend data',
+            '/api/sales/category': 'Get sales by category'
         }
     })
 
-@app.route('/product/<asin>')
-def get_product(asin):
-    if not re.match(r'^[A-Z0-9]{10}$', asin):
-        return jsonify({'error': 'ASIN inválido'}), 400
+@app.route('/api/sales', methods=['GET'])
+def get_sales():
+    # Query parameters
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    category = request.args.get('category')
     
-    data = scrape_amazon_product(asin)
-    return jsonify(data)
-
-@app.route('/products', methods=['POST'])
-def get_products():
-    data = request.get_json()
+    filtered_data = sales_data.copy()
     
-    if not data:
-        return jsonify({'error': 'Se requiere JSON'}), 400
+    if start_date:
+        filtered_data = filtered_data[filtered_data['date'] >= pd.to_datetime(start_date)]
+    if end_date:
+        filtered_data = filtered_data[filtered_data['date'] <= pd.to_datetime(end_date)]
+    if category:
+        filtered_data = filtered_data[filtered_data['category'] == category]
     
-    asins = data.get('asins', [])
-    urls = data.get('urls', [])
-    
-    if urls:
-        asins.extend([extract_asin_from_url(url) for url in urls])
-        asins = [a for a in asins if a]
-    
-    if not asins:
-        return jsonify({'error': 'Se requieren ASINs o URLs'}), 400
-    
-    results = [scrape_amazon_product(asin) for asin in asins[:10]]
+    result = filtered_data.copy()
+    result['date'] = result['date'].dt.strftime('%Y-%m-%d')
     
     return jsonify({
-        'total': len(results),
-        'products': results
+        'data': result.to_dict(orient='records'),
+        'count': len(result)
+    })
+
+@app.route('/api/sales/summary', methods=['GET'])
+def get_summary():
+    summary = {
+        'total_sales': float(sales_data['sales'].sum()),
+        'average_daily_sales': float(sales_data['sales'].mean()),
+        'total_units_sold': int(sales_data['units_sold'].sum()),
+        'max_sales_day': sales_data.loc[sales_data['sales'].idxmax(), 'date'].strftime('%Y-%m-%d'),
+        'max_sales_amount': float(sales_data['sales'].max()),
+        'min_sales_day': sales_data.loc[sales_data['sales'].idxmin(), 'date'].strftime('%Y-%m-%d'),
+        'min_sales_amount': float(sales_data['sales'].min())
+    }
+    
+    return jsonify(summary)
+
+@app.route('/api/sales/trend', methods=['GET'])
+def get_trend():
+    # Group by week or month
+    period = request.args.get('period', 'week')  # week or month
+    
+    trend_data = sales_data.copy()
+    
+    if period == 'month':
+        trend_data['period'] = trend_data['date'].dt.to_period('M')
+    else:
+        trend_data['period'] = trend_data['date'].dt.to_period('W')
+    
+    grouped = trend_data.groupby('period').agg({
+        'sales': 'sum',
+        'units_sold': 'sum'
+    }).reset_index()
+    
+    grouped['period'] = grouped['period'].astype(str)
+    
+    return jsonify({
+        'period': period,
+        'data': grouped.to_dict(orient='records')
+    })
+
+@app.route('/api/sales/category', methods=['GET'])
+def get_category_sales():
+    category_summary = sales_data.groupby('category').agg({
+        'sales': 'sum',
+        'units_sold': 'sum'
+    }).reset_index()
+    
+    category_summary = category_summary.sort_values('sales', ascending=False)
+    
+    return jsonify({
+        'data': category_summary.to_dict(orient='records')
+    })
+
+@app.route('/api/sales/regenerate', methods=['POST'])
+def regenerate_data():
+    global sales_data
+    days = request.json.get('days', 365) if request.json else 365
+    sales_data = generate_sample_data(days)
+    
+    return jsonify({
+        'message': 'Data regenerated successfully',
+        'records': len(sales_data)
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True)
