@@ -28,16 +28,17 @@ THRESHOLDS = {
 class SalesRow:
     """Representa un registro de ventas de SharePoint"""
     def __init__(self, data: Dict[str, Any]):
-        self.ASIN = data.get('Title', '')
-        self.ProductTitle = data.get('field_1', '')
-        self.Brand = data.get('field_2', '')
-        self.StoreCode = data.get('field_3', '')
-        self.Revenue = float(data.get('field_4', 0.0))
-        self.COGS = float(data.get('field_5', 0.0))
-        self.Units = int(data.get('field_6', 0))
-        self.Returns = int(data.get('field_7', 0))
-        self.WeekStart = data.get('field_8', '')
-        self.FiscalWeek = data.get('field_9', '')
+        # Acepta nombres directos O nombres de SharePoint (field_X)
+        self.ASIN = data.get('ASIN') or data.get('Title', '')
+        self.ProductTitle = data.get('ProductTitle') or data.get('field_1', '')
+        self.Brand = data.get('Brand') or data.get('field_2', '')
+        self.StoreCode = data.get('StoreCode') or data.get('field_3', '')
+        self.Revenue = float(data.get('Revenue') or data.get('field_4', 0.0))
+        self.COGS = float(data.get('COGS') or data.get('field_5', 0.0))
+        self.Units = int(data.get('Units') or data.get('field_6', 0))
+        self.Returns = int(data.get('Returns') or data.get('field_7', 0))
+        self.WeekStart = data.get('WeekStart') or data.get('field_8', '')
+        self.FiscalWeek = data.get('FiscalWeek') or data.get('field_9', '')
         
     def get_week_date(self) -> datetime:
         """Convierte WeekStart a datetime"""
@@ -304,21 +305,37 @@ def home():
             '/health': 'GET - Health check'
         },
         'input_format': {
-            'body': {
-                'value': [
+            'Opción 1 (Power Automate Select)': {
+                'body': [
                     {
-                        'Title': 'ASIN',
-                        'field_1': 'Product Title',
-                        'field_2': 'Brand',
-                        'field_3': 'StoreCode',
-                        'field_4': 'Revenue',
-                        'field_5': 'COGS',
-                        'field_6': 'Units',
-                        'field_7': 'Returns',
-                        'field_8': 'WeekStart (YYYY-MM-DD)',
-                        'field_9': 'FiscalWeek'
+                        'ASIN': 'B0ABC123',
+                        'ProductTitle': 'Product Name',
+                        'Brand': 'Brand Name',
+                        'StoreCode': 'IT',
+                        'Revenue': 1234.56,
+                        'Units': 100,
+                        'Returns': 5,
+                        'WeekStart': '2024-09-30',
+                        'FiscalWeek': '2024-W40'
                     }
                 ]
+            },
+            'Opción 2 (SharePoint)': {
+                'body': {
+                    'value': [
+                        {
+                            'Title': 'B0ABC123',
+                            'field_1': 'Product Name',
+                            'field_2': 'Brand Name',
+                            'field_3': 'IT',
+                            'field_4': 1234.56,
+                            'field_6': 100,
+                            'field_7': 5,
+                            'field_8': '2024-09-30',
+                            'field_9': '2024-W40'
+                        }
+                    ]
+                }
             }
         }
     })
@@ -340,15 +357,20 @@ def analyze():
         if not req_body:
             return jsonify({'error': 'Se requiere un cuerpo JSON'}), 400
         
-        # Extraer el array de datos (puede venir en 'body.value' o directamente en 'value')
-        if 'body' in req_body and 'value' in req_body['body']:
-            raw_items = req_body['body']['value']
+        # Extraer el array de datos - ACEPTA MÚLTIPLES FORMATOS
+        if 'body' in req_body:
+            if isinstance(req_body['body'], list):
+                raw_items = req_body['body']  # ✅ {"body": [...]} - TU FORMATO
+            elif 'value' in req_body['body']:
+                raw_items = req_body['body']['value']  # ✅ {"body": {"value": [...]}}
+            else:
+                raw_items = req_body['body']
         elif 'value' in req_body:
-            raw_items = req_body['value']
+            raw_items = req_body['value']  # ✅ {"value": [...]}
         elif isinstance(req_body, list):
-            raw_items = req_body
+            raw_items = req_body  # ✅ [...]
         else:
-            return jsonify({'error': 'Formato JSON no reconocido. Se espera {body: {value: [...]}} o {value: [...]} o [...]'}), 400
+            return jsonify({'error': 'Formato JSON no reconocido. Se espera {body: [...]}, {body: {value: [...]}}, {value: [...]}, o [...]'}), 400
         
         if not raw_items:
             return jsonify({'error': 'No se encontraron datos para analizar'}), 400
