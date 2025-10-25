@@ -14,18 +14,21 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURACIÓN DE UMBRALES ---
 THRESHOLDS = {
-    'minAvgUnits4W': 30,            # Unidades mínimas promedio en 4 semanas para ser considerado
+    'minAvgUnits4W': 30,            # Unidades mínimas promedio en 4 semanas para ser considerado (compatibilidad)
     'minWeeksDown': 3,              # Semanas consecutivas bajando para alerta
-    'minYoYDropPct': -0.15,         # -15% caída YoY mínima para alerta (4W)
+    'minYoYDropPct': -0.15,         # -15% caída YoY mínima para alerta (ventana)
     'minNormSlopeUnits': -0.05,     # Pendiente normalizada de unidades
     'minWeeksUpReturns': 3,         # (definido pero no usado)
-    'minReturnRatio': 0.08,         # 8% ratio de retornos
-    'minNormSlopeReturns': 0.05,    # Pendiente normalizada de retornos
+    'minReturnRatio': 0.08,         # 8% ratio de devoluciones
+    'minNormSlopeReturns': 0.05,    # Pendiente normalizada de devoluciones
     'minRevenue4W': 1000,           # (definido pero no usado)
 
     # --- NUEVOS UMBRALES ---
     'minWoWDropPct': -0.12,          # -12% vs semana anterior => WARNING
     'minYoYSameWeekDropPct': -0.15,  # -15% vs misma semana del año anterior => WARNING
+
+    # --- PARÁMETROS DE VENTANA ---
+    'windowWeeks': 4,                # Tamaño de ventana para análisis principal
 }
 
 # --- CLASES DE DATOS ---
@@ -95,7 +98,7 @@ def calculate_yoy_change(current_weeks: List[SalesRow], previous_year_weeks: Lis
         return 0.0
     return (current_total - previous_total) / previous_total
 
-def get_last_n_weeks(rows: List[SalesRow], n: int = 4) -> List[SalesRow]:
+def get_last_n_weeks(rows: List[SalesRow], n: int) -> List[SalesRow]:
     """Obtiene las últimas N semanas de datos ordenados por fecha"""
     sorted_rows = sorted(rows, key=lambda x: x.get_week_date())
     return sorted_rows[-n:] if len(sorted_rows) >= n else sorted_rows
@@ -153,12 +156,33 @@ def find_same_week_previous_year(previous_year_weeks: List[SalesRow], current_we
             return row
     return None
 
+def format_iso_week(dt: datetime) -> str:
+    """Formatea fecha a semana ISO tipo YYYY-Www"""
+    y, w, _ = dt.isocalendar()
+    return f"{y}-W{w:02d}"
+
+def window_descriptor(weeks: List[SalesRow]) -> Dict[str, str]:
+    """Devuelve metadatos legibles de la ventana usada (p.ej. últimas 4W)."""
+    if not weeks:
+        return {"label": "sin datos", "from_week": "", "to_week": "", "from_date": "", "to_date": ""}
+    start_dt = weeks[0].get_week_date()
+    end_dt = weeks[-1].get_week_date()
+    return {
+        "label": f"últimas {len(weeks)} semanas",
+        "from_week": format_iso_week(start_dt),
+        "to_week": format_iso_week(end_dt),
+        "from_date": start_dt.strftime("%Y-%m-%d"),
+        "to_date": end_dt.strftime("%Y-%m-%d"),
+    }
+
 # --- ANÁLISIS PRINCIPAL ---
 def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
     """
     Analiza las tendencias de ventas por ASIN y StoreCode.
-    Compara las últimas 4 semanas con el mismo período del año anterior.
+    Compara las últimas N (=windowWeeks) semanas con el mismo período del año anterior.
     """
+    window_weeks = THRESHOLDS.get('windowWeeks', 4)
+
     # 1. Agrupar datos por ASIN|StoreCode
     grouped_data = defaultdict(list)
     for row in rows:
@@ -173,18 +197,20 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
         # Ordenar por fecha
         data_list.sort(key=lambda x: x.get_week_date())
         
-        # Obtener las últimas 4 semanas
-        last_4_weeks = get_last_n_weeks(data_list, 4)
-        if len(last_4_weeks) < 4:
+        # Obtener las últimas N semanas (ventana)
+        last_n_weeks = get_last_n_weeks(data_list, window_weeks)
+        if len(last_n_weeks) < window_weeks:
             continue  # No hay suficientes datos para analizar
         
-        # Obtener las mismas 4 semanas del año anterior
-        previous_year_weeks = get_same_weeks_previous_year(data_list, last_4_weeks)
+        win = window_descriptor(last_n_weeks)
+
+        # Obtener las mismas N semanas del año anterior
+        previous_year_weeks = get_same_weeks_previous_year(data_list, last_n_weeks)
         
-        # --- MÉTRICAS ACTUALES (últimas 4 semanas) ---
-        units_current = [w.Units for w in last_4_weeks]
-        revenue_current = [w.Revenue for w in last_4_weeks]
-        returns_current = [w.Returns for w in last_4_weeks]
+        # --- MÉTRICAS ACTUALES (ventana) ---
+        units_current = [w.Units for w in last_n_weeks]
+        revenue_current = [w.Revenue for w in last_n_weeks]
+        returns_current = [w.Returns for w in last_n_weeks]
         
         avg_units = statistics.mean(units_current)
         total_revenue = sum(revenue_current)
@@ -200,17 +226,17 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
         avg_returns = statistics.mean(returns_current) if returns_current else 1.0
         normalized_returns_slope = returns_slope / avg_returns if avg_returns > 0 else 0.0
         
-        # --- COMPARACIÓN YOY (4 semanas) ---
+        # --- COMPARACIÓN YOY (ventana) ---
         yoy_units_change = 0.0
         yoy_revenue_change = 0.0
-        yoy_data_available = len(previous_year_weeks) >= 3  # Requisito mínimo para YoY
+        yoy_data_available = len(previous_year_weeks) >= max(3, window_weeks - 1)  # requisito mínimo flexible
         
         if yoy_data_available:
-            yoy_units_change = calculate_yoy_change(last_4_weeks, previous_year_weeks, 'Units')
-            yoy_revenue_change = calculate_yoy_change(last_4_weeks, previous_year_weeks, 'Revenue')
+            yoy_units_change = calculate_yoy_change(last_n_weeks, previous_year_weeks, 'Units')
+            yoy_revenue_change = calculate_yoy_change(last_n_weeks, previous_year_weeks, 'Revenue')
         
         # --- RATIO DE DEVOLUCIONES ---
-        return_rate = calculate_return_rate(last_4_weeks)
+        return_rate = calculate_return_rate(last_n_weeks)
         
         # --- DETECCIÓN DE ALERTAS ---
         alert_reasons = []
@@ -219,36 +245,53 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
         # ALERTA 1: Tendencia negativa significativa en unidades
         if (normalized_units_slope < THRESHOLDS['minNormSlopeUnits'] and 
             avg_units >= THRESHOLDS['minAvgUnits4W']):
-            alert_reasons.append(f"Tendencia negativa en ventas ({normalized_units_slope:.2%} por semana)")
+            alert_reasons.append(
+                f"Tendencia negativa en ventas en {win['label']} "
+                f"({win['from_week']}→{win['to_week']}; {win['from_date']}→{win['to_date']}). "
+                f"Pendiente normalizada: {normalized_units_slope:.2%} por semana "
+                f"(calculada sobre {len(last_n_weeks)} semanas; media {avg_units:.1f} uds/sem)."
+            )
             alert_severity = 'WARNING'
         
-        # ALERTA 2: Caída YoY significativa (4W)
+        # ALERTA 2: Caída YoY significativa (ventana)
         if (yoy_data_available and yoy_units_change < THRESHOLDS['minYoYDropPct']):
-            alert_reasons.append(f"Caída YoY de {yoy_units_change:.1%} en unidades (4 semanas)")
+            alert_reasons.append(
+                f"Caída YoY de {yoy_units_change:.1%} en unidades comparando {win['label']} "
+                f"({win['from_week']}→{win['to_week']}) vs mismas semanas del año anterior."
+            )
             alert_severity = 'CRITICAL'
         
         # ALERTA 3: Semanas consecutivas bajando
-        if detect_consecutive_weeks_down(last_4_weeks, THRESHOLDS['minWeeksDown']):
-            alert_reasons.append(f"{THRESHOLDS['minWeeksDown']}+ semanas consecutivas bajando")
+        if detect_consecutive_weeks_down(last_n_weeks, THRESHOLDS['minWeeksDown']):
+            alert_reasons.append(
+                f"{THRESHOLDS['minWeeksDown']}+ semanas consecutivas bajando dentro de {win['label']} "
+                f"({win['from_week']}→{win['to_week']})."
+            )
             if alert_severity == 'INFO':
                 alert_severity = 'WARNING'
         
         # ALERTA 4: Alto ratio de devoluciones
         if return_rate > THRESHOLDS['minReturnRatio']:
-            alert_reasons.append(f"Alto ratio de devoluciones ({return_rate:.1%})")
+            alert_reasons.append(
+                f"Alto ratio de devoluciones ({return_rate:.1%}) en {win['label']} "
+                f"({win['from_week']}→{win['to_week']})."
+            )
             if alert_severity == 'INFO':
                 alert_severity = 'WARNING'
         
         # ALERTA 5: Devoluciones en tendencia creciente
         if (normalized_returns_slope > THRESHOLDS['minNormSlopeReturns'] and 
             total_returns > 5):
-            alert_reasons.append(f"Devoluciones creciendo ({normalized_returns_slope:.2%} por semana)")
+            alert_reasons.append(
+                f"Devoluciones en tendencia creciente en {win['label']} "
+                f"({win['from_week']}→{win['to_week']}): {normalized_returns_slope:.2%} por semana."
+            )
             if alert_severity == 'INFO':
                 alert_severity = 'WARNING'
 
         # --- NUEVAS ALERTAS: comparativas puntuales con la última semana ---
-        last_week = last_4_weeks[-1]
-        prev_week = last_4_weeks[-2]
+        last_week = last_n_weeks[-1]
+        prev_week = last_n_weeks[-2]
 
         # 5.A) WARNING por caída WoW (última vs anterior)
         wow_change = None
@@ -257,7 +300,8 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
             if (wow_change < THRESHOLDS['minWoWDropPct'] and
                 avg_units >= THRESHOLDS['minAvgUnits4W']):
                 alert_reasons.append(
-                    f"Bajada WoW de {wow_change:.1%} (semana {last_week.FiscalWeek} vs {prev_week.FiscalWeek})"
+                    f"Bajada WoW de {wow_change:.1%} (semana {last_week.FiscalWeek} vs {prev_week.FiscalWeek}). "
+                    f"Comparativa de la última semana dentro de {win['label']}."
                 )
                 if alert_severity == 'INFO':
                     alert_severity = 'WARNING'
@@ -271,7 +315,8 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                 avg_units >= THRESHOLDS['minAvgUnits4W']):
                 alert_reasons.append(
                     f"Bajada vs misma semana del año anterior de {yoy_same_week_change:.1%} "
-                    f"({last_week.FiscalWeek} vs {same_week_prev_year.FiscalWeek})"
+                    f"({last_week.FiscalWeek} vs {same_week_prev_year.FiscalWeek}). "
+                    f"Comparativa puntual de última semana."
                 )
                 if alert_severity == 'INFO':
                     alert_severity = 'WARNING'
@@ -280,24 +325,34 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
         if alert_reasons:
             product_info = {
                 'ASIN': asin,
-                'ProductTitle': last_4_weeks[0].ProductTitle,
-                'Brand': last_4_weeks[0].Brand,
+                'ProductTitle': last_n_weeks[0].ProductTitle,
+                'Brand': last_n_weeks[0].Brand,
                 'StoreCode': store,
                 'Severity': alert_severity,
                 'AlertReasons': alert_reasons,
                 
-                # Métricas actuales (últimas 4 semanas)
-                'Current_4W': {
+                # Métricas actuales (ventana)
+                'Current_4W': {  # nombre mantenido por compatibilidad con clientes existentes
                     'AvgUnitsPerWeek': round(avg_units, 2),
                     'TotalUnits': total_units,
                     'TotalRevenue': round(total_revenue, 2),
                     'TotalReturns': total_returns,
                     'ReturnRate': round(return_rate, 3),
-                    'UnitsTrend': round(normalized_units_slope, 4),
-                    'ReturnsTrend': round(normalized_returns_slope, 4),
+                    # Campos de ventana explícitos
+                    'WindowWeeks': len(last_n_weeks),
+                    'WindowFromWeek': win['from_week'],
+                    'WindowToWeek': win['to_week'],
+                    'WindowFromDate': win['from_date'],
+                    'WindowToDate': win['to_date'],
+                    # Tendencias (nuevos nombres claros)
+                    'UnitsTrendPerWeekPct': round(normalized_units_slope, 4),
+                    'ReturnsTrendPerWeekPct': round(normalized_returns_slope, 4),
+                    # Compatibilidad (DEPRECATED)
+                    'UnitsTrend': round(normalized_units_slope, 4),       # DEPRECATED: usar UnitsTrendPerWeekPct
+                    'ReturnsTrend': round(normalized_returns_slope, 4),   # DEPRECATED
                 },
                 
-                # Comparación YoY 4W
+                # Comparación YoY (ventana)
                 'YoY_Comparison': {
                     'UnitsChange': round(yoy_units_change, 3),
                     'RevenueChange': round(yoy_revenue_change, 3),
@@ -311,7 +366,7 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                     'YoYSameWeekDataAvailable': same_week_prev_year is not None
                 },
                 
-                # Detalle semanal
+                # Detalle semanal de la ventana
                 'WeeklyDetail': [
                     {
                         'Week': w.FiscalWeek,
@@ -319,12 +374,12 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                         'Units': w.Units,
                         'Revenue': round(w.Revenue, 2),
                         'Returns': w.Returns
-                    } for w in last_4_weeks
+                    } for w in last_n_weeks
                 ]
             }
             alerts.append(product_info)
     
-    # Ordenar por severidad y luego por caída YoY 4W
+    # Ordenar por severidad y luego por caída YoY (ventana)
     severity_order = {'CRITICAL': 0, 'WARNING': 1, 'INFO': 2}
     alerts.sort(key=lambda x: (
         severity_order.get(x['Severity'], 3),
@@ -339,7 +394,7 @@ def home():
     """Endpoint de información"""
     return jsonify({
         'status': 'Sales Trend Analysis API',
-        'version': '1.1',  # versión incrementada por nuevas reglas
+        'version': '1.2',  # versión incrementada por nuevas reglas y textos de timeframe
         'endpoints': {
             '/analyze': 'POST - Analizar tendencias de ventas',
             '/health': 'GET - Health check'
@@ -377,6 +432,9 @@ def home():
                     ]
                 }
             }
+        },
+        'parameters': {
+            'windowWeeks': THRESHOLDS.get('windowWeeks', 4)
         }
     })
 
@@ -443,7 +501,29 @@ def analyze():
                 'critical_alerts': sum(1 for a in alerts if a['Severity'] == 'CRITICAL'),
                 'warning_alerts': sum(1 for a in alerts if a['Severity'] == 'WARNING'),
             },
+            'config': {
+                'windowWeeks': THRESHOLDS.get('windowWeeks', 4),
+                'thresholds': {
+                    'minAvgUnits4W': THRESHOLDS['minAvgUnits4W'],
+                    'minWeeksDown': THRESHOLDS['minWeeksDown'],
+                    'minYoYDropPct': THRESHOLDS['minYoYDropPct'],
+                    'minNormSlopeUnits': THRESHOLDS['minNormSlopeUnits'],
+                    'minReturnRatio': THRESHOLDS['minReturnRatio'],
+                    'minNormSlopeReturns': THRESHOLDS['minNormSlopeReturns'],
+                    'minWoWDropPct': THRESHOLDS['minWoWDropPct'],
+                    'minYoYSameWeekDropPct': THRESHOLDS['minYoYSameWeekDropPct'],
+                }
+            },
             'alerts': alerts
+        }
+
+        # Mini-glosario para clarificar términos en la respuesta
+        response['glossary'] = {
+            'VentanaActual': "Período usado para el análisis principal (por defecto, últimas N semanas consecutivas; N=windowWeeks).",
+            'PendienteNormalizada': "Pendiente de la regresión lineal de la serie semanal dividida por la media de la ventana; representa el % de cambio por semana dentro de la ventana.",
+            'WoW': "Comparativa de la última semana vs la inmediatamente anterior.",
+            'YoY_ventana': "Comparativa de las últimas N semanas vs las mismas N semanas del año anterior.",
+            'YoY_misma_semana': "Comparativa de la última semana vs la semana ISO equivalente del año anterior."
         }
         
         return jsonify(response), 200
