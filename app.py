@@ -3,7 +3,7 @@ from flask_cors import CORS
 import logging
 import json
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import defaultdict
 import statistics
 
@@ -14,14 +14,18 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURACIÓN DE UMBRALES ---
 THRESHOLDS = {
-    'minAvgUnits4W': 30,           # Unidades mínimas promedio en 4 semanas para ser considerado
+    'minAvgUnits4W': 30,            # Unidades mínimas promedio en 4 semanas para ser considerado
     'minWeeksDown': 3,              # Semanas consecutivas bajando para alerta
-    'minYoYDropPct': -0.15,         # -15% caída YoY mínima para alerta
+    'minYoYDropPct': -0.15,         # -15% caída YoY mínima para alerta (4W)
     'minNormSlopeUnits': -0.05,     # Pendiente normalizada de unidades
-    'minWeeksUpReturns': 3,         # Semanas con retornos subiendo
+    'minWeeksUpReturns': 3,         # (definido pero no usado)
     'minReturnRatio': 0.08,         # 8% ratio de retornos
     'minNormSlopeReturns': 0.05,    # Pendiente normalizada de retornos
-    'minRevenue4W': 1000,           # Revenue mínimo en 4 semanas
+    'minRevenue4W': 1000,           # (definido pero no usado)
+
+    # --- NUEVOS UMBRALES ---
+    'minWoWDropPct': -0.12,          # -12% vs semana anterior => WARNING
+    'minYoYSameWeekDropPct': -0.15,  # -15% vs misma semana del año anterior => WARNING
 }
 
 # --- CLASES DE DATOS ---
@@ -44,7 +48,7 @@ class SalesRow:
         """Convierte WeekStart a datetime"""
         try:
             return datetime.strptime(self.WeekStart, '%Y-%m-%d')
-        except:
+        except Exception:
             return datetime(2000, 1, 1)
     
     def get_year(self) -> int:
@@ -52,7 +56,7 @@ class SalesRow:
         return self.get_week_date().year
     
     def get_week_number(self) -> int:
-        """Obtiene el número de semana del año"""
+        """Obtiene el número de semana del año (ISO)"""
         return self.get_week_date().isocalendar()[1]
 
 # --- FUNCIONES AUXILIARES ---
@@ -65,8 +69,7 @@ def calculate_slope(values: List[float]) -> float:
     if n < 2:
         return 0.0
     
-    sx, sy, sxy, sxx = 0, 0, 0, 0
-    
+    sx, sy, sxy, sxx = 0.0, 0.0, 0.0, 0.0
     for i, y in enumerate(values):
         x = float(i)
         sx += x
@@ -88,10 +91,8 @@ def calculate_yoy_change(current_weeks: List[SalesRow], previous_year_weeks: Lis
     """
     current_total = sum(getattr(w, metric) for w in current_weeks)
     previous_total = sum(getattr(w, metric) for w in previous_year_weeks)
-    
     if previous_total == 0:
         return 0.0
-    
     return (current_total - previous_total) / previous_total
 
 def get_last_n_weeks(rows: List[SalesRow], n: int = 4) -> List[SalesRow]:
@@ -108,7 +109,7 @@ def get_same_weeks_previous_year(rows: List[SalesRow], current_weeks: List[Sales
     if not current_weeks:
         return []
     
-    # Obtener el rango de semanas actuales
+    # Rango de semanas actuales
     current_week_numbers = {w.get_week_number() for w in current_weeks}
     current_year = current_weeks[0].get_year()
     target_year = current_year - 1
@@ -118,7 +119,6 @@ def get_same_weeks_previous_year(rows: List[SalesRow], current_weeks: List[Sales
         row for row in rows 
         if row.get_year() == target_year and row.get_week_number() in current_week_numbers
     ]
-    
     return sorted(previous_year_weeks, key=lambda x: x.get_week_date())
 
 def detect_consecutive_weeks_down(weeks: List[SalesRow], min_weeks: int = 3) -> bool:
@@ -128,7 +128,6 @@ def detect_consecutive_weeks_down(weeks: List[SalesRow], min_weeks: int = 3) -> 
     
     units = [w.Units for w in weeks]
     consecutive_down = 0
-    
     for i in range(1, len(units)):
         if units[i] < units[i-1]:
             consecutive_down += 1
@@ -136,18 +135,23 @@ def detect_consecutive_weeks_down(weeks: List[SalesRow], min_weeks: int = 3) -> 
                 return True
         else:
             consecutive_down = 0
-    
     return False
 
 def calculate_return_rate(weeks: List[SalesRow]) -> float:
     """Calcula el ratio de devoluciones sobre unidades vendidas"""
     total_units = sum(w.Units for w in weeks)
     total_returns = sum(w.Returns for w in weeks)
-    
     if total_units == 0:
         return 0.0
-    
     return total_returns / total_units
+
+def find_same_week_previous_year(previous_year_weeks: List[SalesRow], current_week: SalesRow) -> Optional[SalesRow]:
+    """Devuelve el registro de la misma semana ISO del año anterior si existe"""
+    target_week_num = current_week.get_week_number()
+    for row in previous_year_weeks:
+        if row.get_week_number() == target_week_num:
+            return row
+    return None
 
 # --- ANÁLISIS PRINCIPAL ---
 def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
@@ -155,7 +159,6 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
     Analiza las tendencias de ventas por ASIN y StoreCode.
     Compara las últimas 4 semanas con el mismo período del año anterior.
     """
-    
     # 1. Agrupar datos por ASIN|StoreCode
     grouped_data = defaultdict(list)
     for row in rows:
@@ -172,9 +175,8 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
         
         # Obtener las últimas 4 semanas
         last_4_weeks = get_last_n_weeks(data_list, 4)
-        
         if len(last_4_weeks) < 4:
-            continue  # No hay suficientes datos
+            continue  # No hay suficientes datos para analizar
         
         # Obtener las mismas 4 semanas del año anterior
         previous_year_weeks = get_same_weeks_previous_year(data_list, last_4_weeks)
@@ -194,15 +196,16 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
         returns_slope = calculate_slope(returns_current)
         
         # Normalizar pendientes (dividir por el promedio para tener % de cambio)
-        normalized_units_slope = units_slope / avg_units if avg_units > 0 else 0
-        avg_returns = statistics.mean(returns_current) if returns_current else 1
-        normalized_returns_slope = returns_slope / avg_returns if avg_returns > 0 else 0
+        normalized_units_slope = units_slope / avg_units if avg_units > 0 else 0.0
+        avg_returns = statistics.mean(returns_current) if returns_current else 1.0
+        normalized_returns_slope = returns_slope / avg_returns if avg_returns > 0 else 0.0
         
-        # --- COMPARACIÓN YOY ---
+        # --- COMPARACIÓN YOY (4 semanas) ---
         yoy_units_change = 0.0
         yoy_revenue_change = 0.0
+        yoy_data_available = len(previous_year_weeks) >= 3  # Requisito mínimo para YoY
         
-        if len(previous_year_weeks) >= 3:  # Al menos 3 semanas del año anterior
+        if yoy_data_available:
             yoy_units_change = calculate_yoy_change(last_4_weeks, previous_year_weeks, 'Units')
             yoy_revenue_change = calculate_yoy_change(last_4_weeks, previous_year_weeks, 'Revenue')
         
@@ -219,10 +222,9 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
             alert_reasons.append(f"Tendencia negativa en ventas ({normalized_units_slope:.2%} por semana)")
             alert_severity = 'WARNING'
         
-        # ALERTA 2: Caída YoY significativa
-        if (yoy_units_change < THRESHOLDS['minYoYDropPct'] and 
-            len(previous_year_weeks) >= 3):
-            alert_reasons.append(f"Caída YoY de {yoy_units_change:.1%} en unidades")
+        # ALERTA 2: Caída YoY significativa (4W)
+        if (yoy_data_available and yoy_units_change < THRESHOLDS['minYoYDropPct']):
+            alert_reasons.append(f"Caída YoY de {yoy_units_change:.1%} en unidades (4 semanas)")
             alert_severity = 'CRITICAL'
         
         # ALERTA 3: Semanas consecutivas bajando
@@ -234,13 +236,45 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
         # ALERTA 4: Alto ratio de devoluciones
         if return_rate > THRESHOLDS['minReturnRatio']:
             alert_reasons.append(f"Alto ratio de devoluciones ({return_rate:.1%})")
-            alert_severity = 'WARNING'
+            if alert_severity == 'INFO':
+                alert_severity = 'WARNING'
         
         # ALERTA 5: Devoluciones en tendencia creciente
         if (normalized_returns_slope > THRESHOLDS['minNormSlopeReturns'] and 
             total_returns > 5):
             alert_reasons.append(f"Devoluciones creciendo ({normalized_returns_slope:.2%} por semana)")
-            alert_severity = 'WARNING'
+            if alert_severity == 'INFO':
+                alert_severity = 'WARNING'
+
+        # --- NUEVAS ALERTAS: comparativas puntuales con la última semana ---
+        last_week = last_4_weeks[-1]
+        prev_week = last_4_weeks[-2]
+
+        # 5.A) WARNING por caída WoW (última vs anterior)
+        wow_change = None
+        if prev_week.Units > 0:
+            wow_change = (last_week.Units - prev_week.Units) / prev_week.Units
+            if (wow_change < THRESHOLDS['minWoWDropPct'] and
+                avg_units >= THRESHOLDS['minAvgUnits4W']):
+                alert_reasons.append(
+                    f"Bajada WoW de {wow_change:.1%} (semana {last_week.FiscalWeek} vs {prev_week.FiscalWeek})"
+                )
+                if alert_severity == 'INFO':
+                    alert_severity = 'WARNING'
+
+        # 5.B) WARNING por caída vs misma semana del año anterior (si existe)
+        yoy_same_week_change = None
+        same_week_prev_year = find_same_week_previous_year(previous_year_weeks, last_week) if previous_year_weeks else None
+        if same_week_prev_year and same_week_prev_year.Units > 0:
+            yoy_same_week_change = (last_week.Units - same_week_prev_year.Units) / same_week_prev_year.Units
+            if (yoy_same_week_change < THRESHOLDS['minYoYSameWeekDropPct'] and
+                avg_units >= THRESHOLDS['minAvgUnits4W']):
+                alert_reasons.append(
+                    f"Bajada vs misma semana del año anterior de {yoy_same_week_change:.1%} "
+                    f"({last_week.FiscalWeek} vs {same_week_prev_year.FiscalWeek})"
+                )
+                if alert_severity == 'INFO':
+                    alert_severity = 'WARNING'
         
         # Solo agregar a alertas si hay alguna razón
         if alert_reasons:
@@ -263,11 +297,18 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                     'ReturnsTrend': round(normalized_returns_slope, 4),
                 },
                 
-                # Comparación YoY
+                # Comparación YoY 4W
                 'YoY_Comparison': {
                     'UnitsChange': round(yoy_units_change, 3),
                     'RevenueChange': round(yoy_revenue_change, 3),
-                    'DataAvailable': len(previous_year_weeks) >= 3
+                    'DataAvailable': yoy_data_available
+                },
+
+                # Comparativas puntuales (nuevas)
+                'Comparisons': {
+                    'WoWUnitsChange': round(wow_change, 3) if wow_change is not None else None,
+                    'YoYSameWeekUnitsChange': round(yoy_same_week_change, 3) if yoy_same_week_change is not None else None,
+                    'YoYSameWeekDataAvailable': same_week_prev_year is not None
                 },
                 
                 # Detalle semanal
@@ -281,10 +322,9 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                     } for w in last_4_weeks
                 ]
             }
-            
             alerts.append(product_info)
     
-    # Ordenar por severidad y luego por caída YoY
+    # Ordenar por severidad y luego por caída YoY 4W
     severity_order = {'CRITICAL': 0, 'WARNING': 1, 'INFO': 2}
     alerts.sort(key=lambda x: (
         severity_order.get(x['Severity'], 3),
@@ -299,7 +339,7 @@ def home():
     """Endpoint de información"""
     return jsonify({
         'status': 'Sales Trend Analysis API',
-        'version': '1.0',
+        'version': '1.1',  # versión incrementada por nuevas reglas
         'endpoints': {
             '/analyze': 'POST - Analizar tendencias de ventas',
             '/health': 'GET - Health check'
@@ -353,7 +393,6 @@ def analyze():
     """
     try:
         req_body = request.get_json()
-        
         if not req_body:
             return jsonify({'error': 'Se requiere un cuerpo JSON'}), 400
         
@@ -361,7 +400,7 @@ def analyze():
         if 'body' in req_body:
             if isinstance(req_body['body'], list):
                 raw_items = req_body['body']  # ✅ {"body": [...]} - TU FORMATO
-            elif 'value' in req_body['body']:
+            elif isinstance(req_body['body'], dict) and 'value' in req_body['body']:
                 raw_items = req_body['body']['value']  # ✅ {"body": {"value": [...]}}
             else:
                 raw_items = req_body['body']
@@ -417,4 +456,5 @@ def analyze():
         }), 500
 
 if __name__ == '__main__':
+    # Ajusta host/port según tu despliegue
     app.run(host='0.0.0.0', port=5000, debug=True)
