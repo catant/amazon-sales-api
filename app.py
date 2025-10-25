@@ -1,8 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import logging
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
 import statistics
@@ -14,21 +13,27 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURACIÓN DE UMBRALES ---
 THRESHOLDS = {
-    'minAvgUnits4W': 30,            # Unidades mínimas promedio en 4 semanas para ser considerado (compatibilidad)
-    'minWeeksDown': 3,              # Semanas consecutivas bajando para alerta
-    'minYoYDropPct': -0.15,         # -15% caída YoY mínima para alerta (ventana)
-    'minNormSlopeUnits': -0.05,     # Pendiente normalizada de unidades
-    'minWeeksUpReturns': 3,         # (definido pero no usado)
-    'minReturnRatio': 0.08,         # 8% ratio de devoluciones
-    'minNormSlopeReturns': 0.05,    # Pendiente normalizada de devoluciones
-    'minRevenue4W': 1000,           # (definido pero no usado)
+    'minAvgUnits4W': 30,             # Unidades mínimas promedio para considerar señales
+    'minWeeksDown': 3,               # Semanas consecutivas bajando para alerta
+    'minYoYDropPct': -0.15,          # (CRITICAL) caída YoY mínima (ventana) en unidades
+    'minNormSlopeUnits': -0.05,      # Pendiente normalizada de unidades -> WARNING
+    'minWeeksUpReturns': 3,          # (definido pero no usado)
+    'minReturnRatio': 0.08,          # 8% ratio de devoluciones -> WARNING
+    'minNormSlopeReturns': 0.05,     # Pendiente normalizada de devoluciones -> WARNING
+    'minRevenue4W': 1000,            # (definido pero no usado)
 
-    # --- NUEVOS UMBRALES ---
+    # --- COMPARATIVAS PUNTUALES ---
     'minWoWDropPct': -0.12,          # -12% vs semana anterior => WARNING
-    'minYoYSameWeekDropPct': -0.15,  # -15% vs misma semana del año anterior => WARNING
+    'minYoYSameWeekDropPct': -0.15,  # -15% vs misma semana año anterior (última) => WARNING
 
     # --- PARÁMETROS DE VENTANA ---
     'windowWeeks': 4,                # Tamaño de ventana para análisis principal
+
+    # --- NUEVOS UMBRALES CRÍTICOS / CONFLUENCIA ---
+    'minYoYSameWeekDropPctCritical': -0.40,  # ≤ -40% vs misma semana (última) => CRITICAL
+    'minNormSlopeUnitsCritical': -0.20,      # ≤ -20%/sem en ventana => CRITICAL
+    'minWoWDropPctCritical': -0.25,          # ≤ -25% WoW contará como señal fuerte
+    'minConfluenceForCritical': 3,           # nº mínimo de señales para escalar a CRITICAL
 }
 
 # --- CLASES DE DATOS ---
@@ -112,12 +117,10 @@ def get_same_weeks_previous_year(rows: List[SalesRow], current_weeks: List[Sales
     if not current_weeks:
         return []
     
-    # Rango de semanas actuales
     current_week_numbers = {w.get_week_number() for w in current_weeks}
     current_year = current_weeks[0].get_year()
     target_year = current_year - 1
     
-    # Filtrar las semanas del año anterior que coincidan
     previous_year_weeks = [
         row for row in rows 
         if row.get_year() == target_year and row.get_week_number() in current_week_numbers
@@ -241,8 +244,10 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
         # --- DETECCIÓN DE ALERTAS ---
         alert_reasons = []
         alert_severity = 'INFO'
+        severity_source = None
+        signals = []  # recolecta señales activadas (para confluencia)
         
-        # ALERTA 1: Tendencia negativa significativa en unidades
+        # REGLA 1: Tendencia negativa significativa en unidades -> WARNING
         if (normalized_units_slope < THRESHOLDS['minNormSlopeUnits'] and 
             avg_units >= THRESHOLDS['minAvgUnits4W']):
             alert_reasons.append(
@@ -251,49 +256,51 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                 f"Pendiente normalizada: {normalized_units_slope:.2%} por semana "
                 f"(calculada sobre {len(last_n_weeks)} semanas; media {avg_units:.1f} uds/sem)."
             )
-            alert_severity = 'WARNING'
+            signals.append('slope_down')
+            alert_severity = 'WARNING' if alert_severity == 'INFO' else alert_severity
         
-        # ALERTA 2: Caída YoY significativa (ventana)
+        # REGLA 2: Caída YoY significativa (ventana) -> CRITICAL
         if (yoy_data_available and yoy_units_change < THRESHOLDS['minYoYDropPct']):
             alert_reasons.append(
                 f"Caída YoY de {yoy_units_change:.1%} en unidades comparando {win['label']} "
                 f"({win['from_week']}→{win['to_week']}) vs mismas semanas del año anterior."
             )
             alert_severity = 'CRITICAL'
+            severity_source = 'YoY_Window'
         
-        # ALERTA 3: Semanas consecutivas bajando
+        # REGLA 3: Semanas consecutivas bajando -> WARNING
         if detect_consecutive_weeks_down(last_n_weeks, THRESHOLDS['minWeeksDown']):
             alert_reasons.append(
                 f"{THRESHOLDS['minWeeksDown']}+ semanas consecutivas bajando dentro de {win['label']} "
                 f"({win['from_week']}→{win['to_week']})."
             )
-            if alert_severity == 'INFO':
-                alert_severity = 'WARNING'
+            signals.append('consecutive_down')
+            alert_severity = 'WARNING' if alert_severity == 'INFO' else alert_severity
         
-        # ALERTA 4: Alto ratio de devoluciones
+        # REGLA 4: Alto ratio de devoluciones -> WARNING
         if return_rate > THRESHOLDS['minReturnRatio']:
             alert_reasons.append(
                 f"Alto ratio de devoluciones ({return_rate:.1%}) en {win['label']} "
                 f"({win['from_week']}→{win['to_week']})."
             )
-            if alert_severity == 'INFO':
-                alert_severity = 'WARNING'
+            signals.append('high_returns')
+            alert_severity = 'WARNING' if alert_severity == 'INFO' else alert_severity
         
-        # ALERTA 5: Devoluciones en tendencia creciente
+        # REGLA 5: Devoluciones en tendencia creciente -> WARNING
         if (normalized_returns_slope > THRESHOLDS['minNormSlopeReturns'] and 
             total_returns > 5):
             alert_reasons.append(
                 f"Devoluciones en tendencia creciente en {win['label']} "
                 f"({win['from_week']}→{win['to_week']}): {normalized_returns_slope:.2%} por semana."
             )
-            if alert_severity == 'INFO':
-                alert_severity = 'WARNING'
+            signals.append('returns_trend_up')
+            alert_severity = 'WARNING' if alert_severity == 'INFO' else alert_severity
 
-        # --- NUEVAS ALERTAS: comparativas puntuales con la última semana ---
+        # --- COMPARATIVAS PUNTUALES (se necesitan para reglas CRÍTICAS nuevas y confluencia) ---
         last_week = last_n_weeks[-1]
         prev_week = last_n_weeks[-2]
 
-        # 5.A) WARNING por caída WoW (última vs anterior)
+        # WoW
         wow_change = None
         if prev_week.Units > 0:
             wow_change = (last_week.Units - prev_week.Units) / prev_week.Units
@@ -303,10 +310,10 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                     f"Bajada WoW de {wow_change:.1%} (semana {last_week.FiscalWeek} vs {prev_week.FiscalWeek}). "
                     f"Comparativa de la última semana dentro de {win['label']}."
                 )
-                if alert_severity == 'INFO':
-                    alert_severity = 'WARNING'
+                signals.append('wow_drop')
+                alert_severity = 'WARNING' if alert_severity == 'INFO' else alert_severity
 
-        # 5.B) WARNING por caída vs misma semana del año anterior (si existe)
+        # YoY misma semana (última)
         yoy_same_week_change = None
         same_week_prev_year = find_same_week_previous_year(previous_year_weeks, last_week) if previous_year_weeks else None
         if same_week_prev_year and same_week_prev_year.Units > 0:
@@ -318,9 +325,52 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                     f"({last_week.FiscalWeek} vs {same_week_prev_year.FiscalWeek}). "
                     f"Comparativa puntual de última semana."
                 )
-                if alert_severity == 'INFO':
-                    alert_severity = 'WARNING'
-        
+                signals.append('yoy_sameweek_drop')
+                alert_severity = 'WARNING' if alert_severity == 'INFO' else alert_severity
+
+        # --- NUEVAS ESCALADAS A CRITICAL ---
+        # A) Pendiente extremadamente negativa en la ventana
+        if (alert_severity != 'CRITICAL' and
+            normalized_units_slope <= THRESHOLDS['minNormSlopeUnitsCritical'] and
+            avg_units >= THRESHOLDS['minAvgUnits4W']):
+            alert_reasons.append(
+                f"Pendiente extremadamente negativa en la ventana: {normalized_units_slope:.1%} por semana (CRITICAL)."
+            )
+            alert_severity = 'CRITICAL'
+            severity_source = 'SevereSlope'
+
+        # B) YoY misma semana muy severo (última semana)
+        if (alert_severity != 'CRITICAL' and
+            yoy_same_week_change is not None and
+            yoy_same_week_change <= THRESHOLDS['minYoYSameWeekDropPctCritical'] and
+            avg_units >= THRESHOLDS['minAvgUnits4W']):
+            alert_reasons.append(
+                f"Caída muy severa vs misma semana del año anterior: {yoy_same_week_change:.1%} (CRITICAL)."
+            )
+            alert_severity = 'CRITICAL'
+            severity_source = 'SevereYoYSameWeek'
+
+        # C) Confluencia de señales (pondera señales fuertes)
+        if alert_reasons:
+            strong_signals = 0
+            if wow_change is not None and wow_change <= THRESHOLDS['minWoWDropPctCritical']:
+                strong_signals += 1
+            if yoy_same_week_change is not None and yoy_same_week_change <= THRESHOLDS['minYoYSameWeekDropPctCritical']:
+                strong_signals += 1
+            if normalized_units_slope <= THRESHOLDS['minNormSlopeUnitsCritical']:
+                strong_signals += 1
+
+            confluence_score = len(set(signals)) + strong_signals
+
+            if (alert_severity != 'CRITICAL' and
+                confluence_score >= THRESHOLDS['minConfluenceForCritical'] and
+                avg_units >= THRESHOLDS['minAvgUnits4W']):
+                alert_reasons.append(
+                    f"Escalada a CRITICAL por confluencia de señales (score={confluence_score})."
+                )
+                alert_severity = 'CRITICAL'
+                severity_source = 'Confluence'
+
         # Solo agregar a alertas si hay alguna razón
         if alert_reasons:
             product_info = {
@@ -329,10 +379,11 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                 'Brand': last_n_weeks[0].Brand,
                 'StoreCode': store,
                 'Severity': alert_severity,
+                'SeveritySource': severity_source,
                 'AlertReasons': alert_reasons,
                 
                 # Métricas actuales (ventana)
-                'Current_4W': {  # nombre mantenido por compatibilidad con clientes existentes
+                'Current_4W': {  # nombre mantenido por compatibilidad
                     'AvgUnitsPerWeek': round(avg_units, 2),
                     'TotalUnits': total_units,
                     'TotalRevenue': round(total_revenue, 2),
@@ -348,7 +399,7 @@ def analyze_sales_trends(rows: List[SalesRow]) -> List[Dict[str, Any]]:
                     'UnitsTrendPerWeekPct': round(normalized_units_slope, 4),
                     'ReturnsTrendPerWeekPct': round(normalized_returns_slope, 4),
                     # Compatibilidad (DEPRECATED)
-                    'UnitsTrend': round(normalized_units_slope, 4),       # DEPRECATED: usar UnitsTrendPerWeekPct
+                    'UnitsTrend': round(normalized_units_slope, 4),       # DEPRECATED
                     'ReturnsTrend': round(normalized_returns_slope, 4),   # DEPRECATED
                 },
                 
@@ -394,7 +445,7 @@ def home():
     """Endpoint de información"""
     return jsonify({
         'status': 'Sales Trend Analysis API',
-        'version': '1.2',  # versión incrementada por nuevas reglas y textos de timeframe
+        'version': '1.3',  # nuevas reglas CRITICAL + confluencia + timeframe explícito
         'endpoints': {
             '/analyze': 'POST - Analizar tendencias de ventas',
             '/health': 'GET - Health check'
@@ -512,6 +563,10 @@ def analyze():
                     'minNormSlopeReturns': THRESHOLDS['minNormSlopeReturns'],
                     'minWoWDropPct': THRESHOLDS['minWoWDropPct'],
                     'minYoYSameWeekDropPct': THRESHOLDS['minYoYSameWeekDropPct'],
+                    'minYoYSameWeekDropPctCritical': THRESHOLDS['minYoYSameWeekDropPctCritical'],
+                    'minNormSlopeUnitsCritical': THRESHOLDS['minNormSlopeUnitsCritical'],
+                    'minWoWDropPctCritical': THRESHOLDS['minWoWDropPctCritical'],
+                    'minConfluenceForCritical': THRESHOLDS['minConfluenceForCritical'],
                 }
             },
             'alerts': alerts
